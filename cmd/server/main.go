@@ -5,12 +5,18 @@ import (
 	"0TLink/internal/tunnel"
 	"context"
 	"crypto/tls"
+	"fmt"
 	"log"
 	"net"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
-	"time"
+)
+
+var (
+	portMutex sync.Mutex
+	nextPort  = 8081
 )
 
 func main() {
@@ -24,7 +30,6 @@ func main() {
 		log.Fatalf("TLS config error: %v", err)
 	}
 
-	// Enforce modern TLS + mTLS strictly
 	tlsConfig.MinVersion = tls.VersionTLS13
 	tlsConfig.ClientAuth = tls.RequireAndVerifyClientCert
 
@@ -34,14 +39,8 @@ func main() {
 	}
 	defer controlLn.Close()
 
-	publicLn, err := net.Listen("tcp", ":8080")
-	if err != nil {
-		log.Fatalf("Gateway error: %v", err)
-	}
-	defer publicLn.Close()
-
-	log.Println("Control Plane (mTLS): :7000")
-	log.Println("Public Gateway: :8080")
+	log.Println("[Sidecar-Net] Relay active on :7000")
+	log.Println("[Sidecar-Net] Waiting for developer agents...")
 
 	ctx, stop := signal.NotifyContext(
 		context.Background(),
@@ -50,66 +49,63 @@ func main() {
 	)
 	defer stop()
 
-	for {
-		select {
-		case <-ctx.Done():
-			log.Println("Shutting down control plane")
-			return
-		default:
-		}
-
-		conn, err := controlLn.Accept()
-		if err != nil {
-			if ne, ok := err.(net.Error); ok && ne.Temporary() {
-				log.Printf("Temporary accept error: %v", err)
-				time.Sleep(100 * time.Millisecond)
-				continue
+	go func() {
+		for {
+			conn, err := controlLn.Accept()
+			if err != nil {
+				return
 			}
-			log.Printf("Accept error: %v", err)
-			continue
+			go handleAgentConnection(conn)
 		}
+	}()
 
-		go handleClient(conn, publicLn)
-	}
+	<-ctx.Done()
+	log.Println("[Sidecar-Net] Shutting down relay server")
 }
 
-func handleClient(conn net.Conn, publicLn net.Listener) {
+func handleAgentConnection(conn net.Conn) {
 	defer conn.Close()
 
-	tlsConn, ok := conn.(*tls.Conn)
-	if !ok {
-		log.Println("Non-TLS connection rejected")
-		return
-	}
-
+	tlsConn := conn.(*tls.Conn)
 	if err := tlsConn.Handshake(); err != nil {
-		log.Printf("TLS handshake failed: %v", err)
+		log.Printf("mTLS handshake failed: %v", err)
 		return
 	}
 
 	state := tlsConn.ConnectionState()
 	if len(state.PeerCertificates) == 0 {
-		log.Println("Client presented no certificate")
 		return
 	}
 
 	clientID := state.PeerCertificates[0].Subject.CommonName
-	log.Printf("Client authenticated: %s", clientID)
 
-	session, err := tunnel.SetupSession(tlsConn, true)
+	portMutex.Lock()
+	assignedPort := nextPort
+	nextPort++
+	portMutex.Unlock()
+
+	session, err := tunnel.SetupSession(tlsConn, true, tunnel.DefaultConfig)
 	if err != nil {
 		log.Printf("Yamux setup failed for %s: %v", clientID, err)
 		return
 	}
 
+	publicLn, err := net.Listen("tcp", fmt.Sprintf(":%d", assignedPort))
+	if err != nil {
+		log.Printf("Failed to bind port %d for %s: %v", assignedPort, clientID, err)
+		return
+	}
+	defer publicLn.Close()
+
+	log.Printf("[Sidecar-Net] Agent [%s] Online. Access via :%d", clientID, assignedPort)
+
 	for {
 		userConn, err := publicLn.Accept()
 		if err != nil {
 			if session.IsClosed() {
-				log.Printf("Session closed for %s", clientID)
+				log.Printf("[Sidecar-Net] Session ended for %s", clientID)
 				return
 			}
-			log.Printf("Public accept error: %v", err)
 			continue
 		}
 
@@ -119,10 +115,10 @@ func handleClient(conn net.Conn, publicLn net.Listener) {
 			if session.IsClosed() {
 				return
 			}
-			log.Printf("Stream open failed for %s: %v", clientID, err)
 			continue
 		}
 
-		go tunnel.Join(userConn, stream)
+
+		go tunnel.Join(userConn, stream, tunnel.DefaultConfig)
 	}
 }
