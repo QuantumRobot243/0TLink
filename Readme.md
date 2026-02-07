@@ -1,8 +1,6 @@
 # 0TLink
 
-<p align="center">
-  <img src="0TLink/assets/logo.jpg" alt="0TLink Logo" width="500">
-</p>
+![0TLink Logo](assets/logo.jpg)
 
 ## Overview
 
@@ -132,4 +130,5 @@ If no match is found, traffic falls back to **TCP/Opaque mode**.
 
 ## Message
 0TLink is an open-source project.feel free to open an issue or submit a pull request.
+
 
